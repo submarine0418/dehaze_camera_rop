@@ -1,117 +1,91 @@
 #!/usr/bin/env python3
 """
-Arduino Serial �q�T����
-�q Arduino Ū���n��ƭ�
+HW-504 Joystick WASD Event Logger
+- Every input �� NEW LINE printed
+- No overwrite, no deduplication
+- English comments only
 """
 
 import serial
 import time
+import glob
 import sys
 
-print("="*60)
-print("  Arduino Serial Port Test")
-print("="*60)
+# === Optional: uinput keyboard emulation ===
+try:
+    import uinput
+    UINPUT_ENABLED = True
+    device = uinput.Device([
+        uinput.KEY_W, uinput.KEY_A, uinput.KEY_S, uinput.KEY_D
+    ], name="WASD-Joystick")
+    print("uinput enabled: keys will be emulated")
+except Exception as e:
+    UINPUT_ENABLED = False
+    print(f"uinput disabled: {e}")
 
-# Searching for Arduino
-print("\nSearching for Arduino Serial Port...")
-import glob
-ports = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-
+# === Auto-detect serial port ===
+print("Searching for Arduino...")
+ports = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
 if not ports:
-    print("? No Arduino found")
-    print("  Suggestions:")
-    print("  1. Ensure Arduino is properly connected to Raspberry Pi (USB)")
-    print("  2. Ensure Arduino is powered on")
+    print("No Arduino found! Check connection.")
     sys.exit(1)
 
-print(f"? Found {len(ports)} Serial Port(s):")
-for i, port in enumerate(ports):
-    print(f"  {i+1}. {port}")
+port = ports[0]
+print(f"Using port: {port}")
 
-if len(ports) == 1:
-    selected_port = ports[0]
-    print(f"\nSelected Port: {selected_port}")
-else:
-    choice = int(input(f"\nSelect Port (1-{len(ports)}): ")) - 1
-    selected_port = ports[choice]
-
-# Connecting to Arduino
-print(f"\nConnecting to {selected_port}...")
+# === Open serial ===
 try:
-    ser = serial.Serial(
-        port=selected_port,
-        baudrate=115200,
-        timeout=1
-    )
-    
-    # initial Arduino delay
-    print("initial Arduino delay...")
+    ser = serial.Serial(port, 115200, timeout=1)
     time.sleep(2)
-    
-    # buffer
     ser.reset_input_buffer()
-    
-    print("? Serial connection established")
-    print("\nReading sensor data (press Ctrl+C to stop):")
-    print("-"*60)
-    print(f"{'X':<10} {'Y':<10} {'Button':<10} {'Omega':<10} {'Patch':<10}")
-    print("-"*60)
-    
-    try:
-        while True:
-            # Read line
-            line = ser.readline().decode('utf-8').strip()
-            
-            # Skip invalid lines
-            if not line or ',' not in line:
-                continue
-            
-            try:
-                # Parse: "X,Y,B"
-                parts = line.split(',')
-                if len(parts) != 3:
-                    continue
-                
-                x = int(parts[0])
-                y = int(parts[1])
-                button = int(parts[2])
-                
-                # Calculate omega
-                # X (0-1023) to omega (0.80-0.98)
-                omega = 0.80 + (x / 1023.0) * 0.18
-                
-                # Y (0-1023) to patch_size (7-31)
-                patch_raw = 7 + int((y / 1023.0) * 24)
-                patch_size = patch_raw if patch_raw % 2 == 1 else patch_raw + 1
-                
-                # Button
-                button_text = "PRESSED" if button else "Released"
-                print(f"\r{x:<10} {y:<10} {button_text:<10} {omega:<10.2f} {patch_size:<10}", end='')
-                sys.stdout.flush()
-            
-            except ValueError:
-                continue
-    
-    except KeyboardInterrupt:
-        print("\n\nKeyboard interrupt received")
-        ser.close()
-
-except serial.SerialException as e:
-    print(f"? Serial error: {e}")
-    print("\nSuggestions:")
-    print("  1. Ensure Arduino is properly connected")
-    print("  2. Check Serial Port permissions")
-    print("  3. Restart the system to apply Serial Port changes")
-    
-    print("\nPermissions fix:")
-    print(f"  sudo chmod 666 {selected_port}")
-    print(f"  or")
-    print(f"  sudo usermod -a -G dialout $USER")
-    print(f"  (Log out and log back in)")
-
+    print("Arduino connected. Waiting for WASD events...\n")
 except Exception as e:
-    print(f"? Error: {e}")
-    import traceback
-    traceback.print_exc()
+    print(f"Serial error: {e}")
+    sys.exit(1)
 
-print("\n" + "="*60)
+# === Direction map ===
+dir_map = {'D': 'UP', 'S': 'LEFT', 'A': 'DOWN', 'W': 'RIGHT'}
+
+# === Header ===
+print("=" * 60)
+print("   WASD Event Logger (Ctrl+C to exit)")
+print("   Push UP��D  LEFT��S  DOWN��A  RIGHT��W")
+print("=" * 60)
+print()  # Empty line for separation
+
+# === Buffer for partial reads ===
+buffer = ""
+
+try:
+    while True:
+        if ser.in_waiting > 0:
+            raw = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+            buffer += raw
+
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                line = line.strip('\r\n')  # Clean \r and \n
+
+                if not line:
+                    continue
+
+                if line in ['W', 'A', 'S', 'D']:
+                    direction = dir_map[line]
+                    # Print every time input is received
+                    print(f"  INPUT �� {direction:>5}  ({line})")
+
+                    if UINPUT_ENABLED:
+                        code = getattr(uinput, f"KEY_{line}")
+                        # Press and release instantly to simulate a tap
+                        device.emit(code, 1)
+                        device.emit(code, 0)
+                        device.syn()
+
+        else:
+            time.sleep(0.01)
+
+except KeyboardInterrupt:
+    print("\n\nStopped by user.")
+finally:
+    ser.close()
+    print("Serial closed.")
