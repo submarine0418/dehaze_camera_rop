@@ -1,4 +1,4 @@
-// serial_to_keyboard.c
+// serial_to_keyboard.c - 改進版
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
@@ -8,121 +8,207 @@
 #include <unistd.h>
 #include <termios.h>
 #include <signal.h>
+#include <errno.h>
 
 int uinput_fd = -1;
 int serial_fd = -1;
 
 void cleanup(int sig) {
+    printf("\nCleaning up...\n");
+    
     if (uinput_fd >= 0) {
         ioctl(uinput_fd, UI_DEV_DESTROY);
         close(uinput_fd);
     }
-    if (serial_fd >= 0) close(serial_fd);
+    if (serial_fd >= 0) {
+        close(serial_fd);
+    }
+    
+    printf("Exited.\n");
     exit(0);
+}
+
+void emit(int fd, int type, int code, int value) {
+    struct input_event ev;
+    memset(&ev, 0, sizeof(ev));
+    
+    ev.type = type;
+    ev.code = code;
+    ev.value = value;
+    
+    // 讓 kernel 自動設定時間
+    gettimeofday(&ev.time, NULL);
+    
+    if (write(fd, &ev, sizeof(ev)) < 0) {
+        perror("write event failed");
+    }
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        fprintf(stderr, "用法: %s /dev/ttyACM0\n", argv[0]);
+        fprintf(stderr, "Usage: sudo %s /dev/ttyACM0\n", argv[0]);
         return 1;
     }
 
     signal(SIGINT, cleanup);
     signal(SIGTERM, cleanup);
 
-    // === 開啟串口 ===
-    serial_fd = open(argv[1], O_RDONLY | O_NOCTTY | O_NDELAY);
+    // === 開啟 Serial Port ===
+    printf("Opening serial port: %s\n", argv[1]);
+    
+    serial_fd = open(argv[1], O_RDONLY | O_NOCTTY);
     if (serial_fd < 0) {
-        perror("開啟串口失敗");
+        perror("Failed to open serial port");
         return 1;
     }
 
+    // 設定 Serial Port
     struct termios tty;
-    tcgetattr(serial_fd, &tty);
-    cfsetospeed(&tty, B115200);
-    cfsetispeed(&tty, B115200);
-    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-    tty.c_iflag = 0;
-    tty.c_oflag = 0;
-    tty.c_lflag = 0;
-    tty.c_cc[VMIN] = 1;
-    tty.c_cc[VTIME] = 0;
-    tcsetattr(serial_fd, TCSANOW, &tty);
-
-    // === 開啟 uinput ===
-    uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-    if (uinput_fd < 0) {
-        perror("開啟 /dev/uinput 失敗");
+    memset(&tty, 0, sizeof(tty));
+    
+    if (tcgetattr(serial_fd, &tty) != 0) {
+        perror("tcgetattr failed");
         close(serial_fd);
         return 1;
     }
 
-    // 設定支援按鍵
+    // 115200 baud, 8N1
+    cfsetospeed(&tty, B115200);
+    cfsetispeed(&tty, B115200);
+    
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;  // 8-bit
+    tty.c_cflag |= (CLOCAL | CREAD);             // 啟用接收
+    tty.c_cflag &= ~(PARENB | PARODD);           // 無 parity
+    tty.c_cflag &= ~CSTOPB;                      // 1 stop bit
+    tty.c_cflag &= ~CRTSCTS;                     // 無硬體流控
+    
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY);      // 無軟體流控
+    tty.c_iflag &= ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL);
+    
+    tty.c_lflag = 0;                             // 非 canonical mode
+    tty.c_oflag = 0;                             // 無輸出處理
+    
+    tty.c_cc[VMIN] = 1;   // 至少讀 1 個字元
+    tty.c_cc[VTIME] = 1;  // 0.1 秒 timeout
+    
+    if (tcsetattr(serial_fd, TCSANOW, &tty) != 0) {
+        perror("tcsetattr failed");
+        close(serial_fd);
+        return 1;
+    }
+    
+    printf("✓ Serial port configured\n");
+    
+    // 清空 buffer
+    tcflush(serial_fd, TCIFLUSH);
+
+    // === 開啟 uinput ===
+    printf("Opening /dev/uinput...\n");
+    
+    uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (uinput_fd < 0) {
+        perror("Failed to open /dev/uinput (需要 sudo)");
+        close(serial_fd);
+        return 1;
+    }
+
+    // 啟用按鍵事件
     ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY);
     ioctl(uinput_fd, UI_SET_KEYBIT, KEY_W);
     ioctl(uinput_fd, UI_SET_KEYBIT, KEY_A);
     ioctl(uinput_fd, UI_SET_KEYBIT, KEY_S);
     ioctl(uinput_fd, UI_SET_KEYBIT, KEY_D);
 
-    struct uinput_user_dev uidev;
-    memset(&uidev, 0, sizeof(uidev));
-    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Arduino-Joystick-Keyboard");
-    uidev.id.bustype = BUS_USB;
-    uidev.id.vendor  = 0x1;
-    uidev.id.product = 0x1;
-    uidev.id.version = 1;
+    // 設定虛擬設備資訊
+    struct uinput_setup usetup;
+    memset(&usetup, 0, sizeof(usetup));
+    
+    usetup.id.bustype = BUS_USB;
+    usetup.id.vendor = 0x2341;   // Arduino VID
+    usetup.id.product = 0x0043;  // Uno PID
+    usetup.id.version = 1;
+    strcpy(usetup.name, "Arduino-Joystick-WASD");
 
-    write(uinput_fd, &uidev, sizeof(uidev));
-    ioctl(uinput_fd, UI_DEV_CREATE);
+    if (ioctl(uinput_fd, UI_DEV_SETUP, &usetup) < 0) {
+        perror("UI_DEV_SETUP failed");
+        close(uinput_fd);
+        close(serial_fd);
+        return 1;
+    }
 
-    printf("虛擬鍵盤已建立！監聽 %s...\n", argv[1]);
+    // 創建設備
+    if (ioctl(uinput_fd, UI_DEV_CREATE) < 0) {
+        perror("UI_DEV_CREATE failed");
+        close(uinput_fd);
+        close(serial_fd);
+        return 1;
+    }
 
-    // === 主迴圈：讀串口 → 發鍵盤事件 ===
-    char buf[2];
-    while (read(serial_fd, buf, 1) > 0) {
-        if (buf[0] != 'W' && buf[0] != 'A' && buf[0] != 'S' && buf[0] != 'D') {
+    printf("✓ uinput device created\n");
+    sleep(1);  // 等待設備穩定
+
+    // === 主迴圈 ===
+    printf("\n🎮 Arduino Joystick → WASD Keyboard\n");
+    printf("Press Ctrl+C to exit\n\n");
+
+    // 按鍵映射
+    int key_map[256] = {0};
+    key_map['W'] = KEY_W;
+    key_map['A'] = KEY_A;
+    key_map['S'] = KEY_S;
+    key_map['D'] = KEY_D;
+    
+    char buffer[256];
+    int pos = 0;
+    char c;
+
+    while (1) {
+        int n = read(serial_fd, &c, 1);
+        
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;
+            }
+            perror("read failed");
+            break;
+        }
+        
+        if (n == 0) {
+            usleep(1000);
             continue;
         }
 
-        int key_code = 0;
-        switch (buf[0]) {
-            case 'W': key_code = KEY_W; break;
-            case 'A': key_code = KEY_A; break;
-            case 'S': key_code = KEY_S; break;
-            case 'D': key_code = KEY_D; break;
+        // 收集完整的一行
+        if (c == '\n' || c == '\r') {
+            if (pos > 0) {
+                buffer[pos] = '\0';
+                
+                // 解析按鍵
+                char key_char = buffer[0];
+                
+                if (key_map[(int)key_char]) {
+                    int key_code = key_map[(int)key_char];
+                    
+                    printf("Key: %c\n", key_char);
+                    
+                    // 按下
+                    emit(uinput_fd, EV_KEY, key_code, 1);
+                    emit(uinput_fd, EV_SYN, SYN_REPORT, 0);
+                    
+                    // 延遲 (模擬按鍵時間)
+                    usleep(50000);  // 50ms
+                    
+                    // 放開
+                    emit(uinput_fd, EV_KEY, key_code, 0);
+                    emit(uinput_fd, EV_SYN, SYN_REPORT, 0);
+                }
+                
+                pos = 0;
+            }
+        } else if (pos < sizeof(buffer) - 1) {
+            buffer[pos++] = c;
         }
-
-        struct input_event ev;
-
-        // 按下
-        memset(&ev, 0, sizeof(ev));
-        ev.type = EV_KEY;
-        ev.code = key_code;
-        ev.value = 1;
-        write(uinput_fd, &ev, sizeof(ev));
-
-        // 同步
-        memset(&ev, 0, sizeof(ev));
-        ev.type = EV_SYN;
-        ev.code = SYN_REPORT;
-        ev.value = 0;
-        write(uinput_fd, &ev, sizeof(ev));
-
-        usleep(50000); // 50ms 按鍵持續時間
-
-        // 抬起
-        memset(&ev, 0, sizeof(ev));
-        ev.type = EV_KEY;
-        ev.code = key_code;
-        ev.value = 0;
-        write(uinput_fd, &ev, sizeof(ev));
-
-        // 同步
-        memset(&ev, 0, sizeof(ev));
-        ev.type = EV_SYN;
-        ev.code = SYN_REPORT;
-        ev.value = 0;
-        write(uinput_fd, &ev, sizeof(ev));
     }
 
     cleanup(0);
