@@ -1,0 +1,130 @@
+// serial_to_keyboard.c
+#include <fcntl.h>
+#include <linux/input.h>
+#include <linux/uinput.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <termios.h>
+#include <signal.h>
+
+int uinput_fd = -1;
+int serial_fd = -1;
+
+void cleanup(int sig) {
+    if (uinput_fd >= 0) {
+        ioctl(uinput_fd, UI_DEV_DESTROY);
+        close(uinput_fd);
+    }
+    if (serial_fd >= 0) close(serial_fd);
+    exit(0);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "用法: %s /dev/ttyACM0\n", argv[0]);
+        return 1;
+    }
+
+    signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
+
+    // === 開啟串口 ===
+    serial_fd = open(argv[1], O_RDONLY | O_NOCTTY | O_NDELAY);
+    if (serial_fd < 0) {
+        perror("開啟串口失敗");
+        return 1;
+    }
+
+    struct termios tty;
+    tcgetattr(serial_fd, &tty);
+    cfsetospeed(&tty, B115200);
+    cfsetispeed(&tty, B115200);
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+    tty.c_iflag = 0;
+    tty.c_oflag = 0;
+    tty.c_lflag = 0;
+    tty.c_cc[VMIN] = 1;
+    tty.c_cc[VTIME] = 0;
+    tcsetattr(serial_fd, TCSANOW, &tty);
+
+    // === 開啟 uinput ===
+    uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (uinput_fd < 0) {
+        perror("開啟 /dev/uinput 失敗");
+        close(serial_fd);
+        return 1;
+    }
+
+    // 設定支援按鍵
+    ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(uinput_fd, UI_SET_KEYBIT, KEY_W);
+    ioctl(uinput_fd, UI_SET_KEYBIT, KEY_A);
+    ioctl(uinput_fd, UI_SET_KEYBIT, KEY_S);
+    ioctl(uinput_fd, UI_SET_KEYBIT, KEY_D);
+
+    struct uinput_user_dev uidev;
+    memset(&uidev, 0, sizeof(uidev));
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Arduino-Joystick-Keyboard");
+    uidev.id.bustype = BUS_USB;
+    uidev.id.vendor  = 0x1;
+    uidev.id.product = 0x1;
+    uidev.id.version = 1;
+
+    write(uinput_fd, &uidev, sizeof(uidev));
+    ioctl(uinput_fd, UI_DEV_CREATE);
+
+    printf("虛擬鍵盤已建立！監聽 %s...\n", argv[1]);
+
+    // === 主迴圈：讀串口 → 發鍵盤事件 ===
+    char buf[2];
+    while (read(serial_fd, buf, 1) > 0) {
+        if (buf[0] != 'W' && buf[0] != 'A' && buf[0] != 'S' && buf[0] != 'D') {
+            continue;
+        }
+
+        int key_code = 0;
+        switch (buf[0]) {
+            case 'W': key_code = KEY_W; break;
+            case 'A': key_code = KEY_A; break;
+            case 'S': key_code = KEY_S; break;
+            case 'D': key_code = KEY_D; break;
+        }
+
+        struct input_event ev;
+
+        // 按下
+        memset(&ev, 0, sizeof(ev));
+        ev.type = EV_KEY;
+        ev.code = key_code;
+        ev.value = 1;
+        write(uinput_fd, &ev, sizeof(ev));
+
+        // 同步
+        memset(&ev, 0, sizeof(ev));
+        ev.type = EV_SYN;
+        ev.code = SYN_REPORT;
+        ev.value = 0;
+        write(uinput_fd, &ev, sizeof(ev));
+
+        usleep(50000); // 50ms 按鍵持續時間
+
+        // 抬起
+        memset(&ev, 0, sizeof(ev));
+        ev.type = EV_KEY;
+        ev.code = key_code;
+        ev.value = 0;
+        write(uinput_fd, &ev, sizeof(ev));
+
+        // 同步
+        memset(&ev, 0, sizeof(ev));
+        ev.type = EV_SYN;
+        ev.code = SYN_REPORT;
+        ev.value = 0;
+        write(uinput_fd, &ev, sizeof(ev));
+    }
+
+    cleanup(0);
+    return 0;
+}
