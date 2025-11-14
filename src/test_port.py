@@ -44,12 +44,12 @@ except Exception as e:
     sys.exit(1)
 
 # === Direction map ===
-dir_map = {'D': 'UP', 'S': 'LEFT', 'A': 'DOWN', 'W': 'RIGHT'}
+dir_map = {'D': 'right', 'S': 'down', 'A': 'left', 'W': 'up'}
 
 # === Header ===
 print("=" * 60)
 print("   WASD Event Logger (Ctrl+C to exit)")
-print("   Push UP��D  LEFT��S  DOWN��A  RIGHT��W")
+print("   Push UP D  LEFT A  DOWN S  RIGHT W")
 print("=" * 60)
 print()  # Empty line for separation
 
